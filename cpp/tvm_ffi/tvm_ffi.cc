@@ -586,12 +586,50 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def(
           "compile_grammar_from_strings",
           [](GrammarCompilerObj* o, ffi::String ebnf_str, ffi::String root_rule_name) {
-            return ffi::ObjectRef(ffi::make_object<CompiledGrammarObj>(
-                o->value.CompileGrammar(ebnf_str, root_rule_name)
-            ));
+            return ffi::ObjectRef(
+                ffi::make_object<CompiledGrammarObj>(
+                    o->value.CompileGrammar(ebnf_str, root_rule_name)
+                )
+            );
+          }
+      )
+      .def(
+          "prepare_byte_grammar",
+          [](GrammarCompilerObj* o, O grammar_ref, int64_t max_nodes) {
+            XGRAMMAR_FFI_TRY_BEGIN();
+            return ffi::String(
+                o->value.PrepareByteGrammar(grammar_ref.as<GrammarObj>()->value, max_nodes)
+            );
+            XGRAMMAR_FFI_TRY_END();
+          }
+      )
+      .def(
+          "compile_optimized_byte_grammar",
+          [](GrammarCompilerObj* o, O grammar_ref, ffi::String plan_json) {
+            XGRAMMAR_FFI_TRY_BEGIN();
+            return ffi::ObjectRef(
+                ffi::make_object<CompiledGrammarObj>(o->value.CompileOptimizedByteGrammar(
+                    grammar_ref.as<GrammarObj>()->value, plan_json
+                ))
+            );
+            XGRAMMAR_FFI_TRY_END();
+          }
+      )
+      .def(
+          "inspect_compilation",
+          [](GrammarCompilerObj* o, O grammar_ref, ffi::String plan_json) {
+            XGRAMMAR_FFI_TRY_BEGIN();
+            return ffi::String(
+                o->value.InspectCompilation(grammar_ref.as<GrammarObj>()->value, plan_json)
+            );
+            XGRAMMAR_FFI_TRY_END();
           }
       )
       .def("clear_cache", [](GrammarCompilerObj* o) { o->value.ClearCache(); })
+      .def(
+          "get_byte_cache_stats",
+          [](GrammarCompilerObj* o) { return ffi::String(o->value.GetByteCacheStats()); }
+      )
       .def(
           "get_cache_size_bytes",
           [](const GrammarCompilerObj* o) { return o->value.GetCacheSizeBytes(); }

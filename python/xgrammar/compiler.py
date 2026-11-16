@@ -371,9 +371,67 @@ class GrammarCompiler(XGRObject):
         else:
             raise ValueError("Invalid grammar type. Please pass a string or a Grammar object.")
 
+    def prepare_byte_grammar(self, grammar: Grammar, *, max_observer_nodes: int = 2000000) -> str:
+        """Export optimized Grammar and native scheme-3 compilation sidecars as JSON.
+
+        This trusted preprocessing creates no final mask cache. The caller translates
+        byte fields and binds the result to an immutable model/profile. Cache must be
+        disabled, and max_threads must be in [1, 8]. Preparation itself stays
+        sequential; the thread setting does not change its serialized output.
+        """
+        if not isinstance(grammar, Grammar):
+            raise TypeError("prepare_byte_grammar requires a Grammar object")
+        if type(max_observer_nodes) is not int or not 1 <= max_observer_nodes <= 10000000:
+            raise ValueError("max_observer_nodes must be in [1, 10000000]")
+        return str(self._handle.prepare_byte_grammar(grammar._handle, max_observer_nodes))
+
+    def compile_optimized_byte_grammar(self, grammar: Grammar, plan_json: str) -> CompiledGrammar:
+        """Build native caches without reoptimizing a translated, sanitized Grammar.
+
+        Sidecars supply reference intervals, the permuted ASCII predicate and finite
+        native lookahead observations; they are not precomputed final token masks.
+        With max_threads in [1, 8], state tasks may run in
+        parallel over the same immutable inputs. The returned cache is complete;
+        worker exceptions are propagated before a result can be returned.
+        cache_enabled=True reuses exact final state masks across compatible
+        rules, after validating each new plan. Native AST/base-mask lookahead
+        adaptation is deliberately bypassed for this byte-only entry.
+        """
+        if not isinstance(grammar, Grammar) or not isinstance(plan_json, str):
+            raise TypeError("expected a Grammar and byte-plan JSON string")
+        return CompiledGrammar._create_from_handle(
+            self._handle.compile_optimized_byte_grammar(grammar._handle, plan_json)
+        )
+
+    def inspect_compilation(self, grammar: Grammar, plan_json: Optional[str] = None) -> str:
+        """Test-only actual compilation and index/branch trace, without token text.
+
+        None selects native optimization and cache construction. A plan selects the
+        optimized byte entry. Production compile calls collect no diagnostic trace.
+        This diagnostic entry requires cache disabled and max_threads in [1, 8].
+        Traces are published safely and sorted by rule/state after all workers join,
+        so thread completion order is not part of the comparison contract.
+        """
+        if not isinstance(grammar, Grammar) or (
+            plan_json is not None and not isinstance(plan_json, str)
+        ):
+            raise TypeError("expected a Grammar and optional byte-plan JSON string")
+        if plan_json is not None and not plan_json.strip():
+            raise ValueError("an explicit byte plan must not be empty")
+        return str(self._handle.inspect_compilation(grammar._handle, plan_json or ""))
+
     def clear_cache(self) -> None:
         """Clear all cached compiled grammars."""
         self._handle.clear_cache()
+
+    def get_byte_cache_stats(self) -> str:
+        """Return actual scheme-3 cache counters and accounted memory as JSON.
+
+        This opt-in diagnostic is not needed on production cache hits. clear_cache
+        resets both entries and counters. Memory includes persistent key bytes;
+        temporary compiler/key-building allocations are outside the LRU budget.
+        """
+        return str(self._handle.get_byte_cache_stats())
 
     def get_cache_size_bytes(self) -> int:
         """The approximate memory usage of the cache in bytes."""

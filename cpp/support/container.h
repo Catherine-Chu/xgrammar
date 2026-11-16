@@ -5,6 +5,8 @@
  */
 #ifndef XGRAMMAR_SUPPORT_CONTAINER_H_
 #define XGRAMMAR_SUPPORT_CONTAINER_H_
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "logging.h"
@@ -108,6 +110,17 @@ class List {
     int node = node_pool_.Allocate();
     XGRAMMAR_DCHECK(0 < node && node < node_pool_.Size());
     node_pool_[node].value = value;
+    LinkBefore(node, 0);
+    return iterator(node, *this);
+  }
+
+  // Prepare allocation-owning values before publishing their list/index entry.
+  // If pool allocation fails the list is unchanged; the remaining move and
+  // link cannot throw. Used by exact rule-cache keys and their mask payloads.
+  iterator PushBackNoThrowMove(Value&& value) {
+    static_assert(std::is_nothrow_move_assignable_v<Value>);
+    int node = node_pool_.Allocate();
+    node_pool_[node].value = std::move(value);
     LinkBefore(node, 0);
     return iterator(node, *this);
   }

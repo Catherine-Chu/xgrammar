@@ -28,6 +28,7 @@
 #include "suffix_automata.h"
 #include "support/container.h"
 #include "support/encoding.h"
+#include "support/json_serializer.h"
 #include "support/logging.h"
 #include "xgrammar/grammar.h"
 
@@ -3684,11 +3685,31 @@ std::optional<uint64_t> GrammarFSMHasherImpl::HashSequence(
 
 class RuleLevelCache::Impl {
  public:
-  using NodeKey = std::tuple<
+  using NativeKey = std::tuple<
       uint64_t /*The hash value of the FSM*/,
       int32_t /* The normalized node id*/,
       int32_t /*The number of states*/,
       int32_t /* The number of edges*/>;
+  struct NodeKey {
+    NativeKey native;
+    std::shared_ptr<const std::string> context;
+    std::string state;
+    bool operator==(const NodeKey& rhs) const {
+      if (native != rhs.native || static_cast<bool>(context) != static_cast<bool>(rhs.context))
+        return false;
+      return !context ||
+             (state == rhs.state && (context == rhs.context || *context == *rhs.context));
+    }
+  };
+  struct NodeHash {
+    size_t operator()(const NodeKey& key) const {
+      return HashCombine(
+          std::hash<NativeKey>{}(key.native),
+          key.context ? std::hash<std::string>{}(key.state) : 0,
+          static_cast<bool>(key.context)
+      );
+    }
+  };
   using NodeType = std::pair<NodeKey, AdaptiveTokenMask>;
 
   explicit Impl(size_t max_cache_memory_size) : max_cache_memory_size_(max_cache_memory_size) {}
@@ -3717,10 +3738,18 @@ class RuleLevelCache::Impl {
   );
 
   void ClearCache();
+  std::optional<AdaptiveTokenMask> GetByteCache(const ByteKey& key) {
+    return Get({{key.context_hash, 0, 0, 0}, key.context, key.state});
+  }
+  bool AddByteCache(const ByteKey& key, const AdaptiveTokenMask& value) {
+    return Add({{key.context_hash, 0, 0, 0}, key.context, key.state}, AdaptiveTokenMask(value));
+  }
+  std::string GetByteCacheStats() const;
 
   friend size_t MemorySize(const Impl* impl) {
     int64_t total = 0;
     for (const auto& shard : impl->shards_) {
+      std::lock_guard<std::mutex> lock(shard.mutex);
       total += shard.current_cache_memory_size;
     }
     return total;
@@ -3737,15 +3766,36 @@ class RuleLevelCache::Impl {
   static constexpr size_t kNumShards = 16;
 
   struct Shard {
-    std::mutex mutex;
+    mutable std::mutex mutex;
     int64_t current_cache_memory_size = 0;
     // The cache map: (fsm_hash, node_id, ...) -> index in cache_list
     List<NodeType> cache_list;
-    std::unordered_map<NodeKey, int> cache;
+    std::unordered_map<NodeKey, int, NodeHash> cache;
+    std::unordered_map<const std::string*, size_t> context_references;
+    int64_t hits = 0, misses = 0, inserts = 0, evictions = 0, rejected_inserts = 0;
+    int64_t byte_entries = 0, byte_memory = 0, key_memory = 0;
   };
 
   Shard& GetShard(const NodeKey& key) {
-    return shards_[HashCombine(std::get<0>(key), std::get<1>(key)) % kNumShards];
+    if (!key.context) {
+      return shards_[HashCombine(std::get<0>(key.native), std::get<1>(key.native)) % kNumShards];
+    }
+    return shards_[NodeHash{}(key) % kNumShards];
+  }
+
+  std::optional<AdaptiveTokenMask> Get(const NodeKey& key);
+  bool Add(const NodeKey& key, AdaptiveTokenMask&& value);
+  static size_t StateKeySize(const NodeKey& key) {
+    // The list and hash index each own a small state suffix/shared pointer.
+    return key.context ? 2 * (sizeof(NodeKey) + key.state.size()) : 0;
+  }
+  static size_t ContextSize(const NodeKey& key) {
+    return sizeof(std::string) + key.context->capacity() + sizeof(void*) + sizeof(size_t);
+  }
+  static size_t AddedKeySize(const Shard& shard, const NodeKey& key) {
+    if (!key.context) return 0;
+    return StateKeySize(key) +
+           (shard.context_references.count(key.context.get()) ? 0 : ContextSize(key));
   }
 
   /*! \brief The memory budget of one shard. Eviction is performed per shard. */
@@ -3791,20 +3841,32 @@ void RuleLevelCache::ClearCache() { pimpl_->ClearCache(); }
 
 size_t RuleLevelCache::GetMaxSize() const { return pimpl_->GetMaxSize(); }
 
+std::optional<AdaptiveTokenMask> RuleLevelCache::GetByteCache(const ByteKey& key) {
+  return pimpl_->GetByteCache(key);
+}
+bool RuleLevelCache::AddByteCache(const ByteKey& key, const AdaptiveTokenMask& value) {
+  return pimpl_->AddByteCache(key, value);
+}
+std::string RuleLevelCache::GetByteCacheStats() const { return pimpl_->GetByteCacheStats(); }
+
 std::optional<AdaptiveTokenMask> RuleLevelCache::Impl::GetCache(
     const uint64_t& fsm_hash,
     int32_t fsm_new_node_id,
     const int32_t& state_cnt,
     const int32_t edge_cnt
 ) {
-  // Find in the cache.
-  NodeKey key = std::make_tuple(fsm_hash, fsm_new_node_id, state_cnt, edge_cnt);
+  return Get({{fsm_hash, fsm_new_node_id, state_cnt, edge_cnt}, nullptr, {}});
+}
+
+std::optional<AdaptiveTokenMask> RuleLevelCache::Impl::Get(const NodeKey& key) {
   Shard& shard = GetShard(key);
   std::lock_guard<std::mutex> lock(shard.mutex);
   auto it = shard.cache.find(key);
   if (it == shard.cache.end()) {
+    if (key.context) ++shard.misses;
     return std::nullopt;
   }
+  if (key.context) ++shard.hits;
 
   // Move the node to the back of the list.
   shard.cache_list.MoveBack(it->second);
@@ -3828,13 +3890,21 @@ bool RuleLevelCache::Impl::AddCache(
     const int32_t edge_cnt,
     AdaptiveTokenMask&& token_mask
 ) {
-  // Check if we can add to the cache.
-  NodeKey key = std::make_tuple(fsm_hash, fsm_new_node_id, state_cnt, edge_cnt);
+  return Add(
+      {{fsm_hash, fsm_new_node_id, state_cnt, edge_cnt}, nullptr, {}}, std::move(token_mask)
+  );
+}
+
+bool RuleLevelCache::Impl::Add(const NodeKey& key, AdaptiveTokenMask&& token_mask) {
   Shard& shard = GetShard(key);
   const size_t shard_max_size = ShardMaxSize();
   std::lock_guard<std::mutex> lock(shard.mutex);
-  if (shard_max_size != kUnlimitedSize && MemorySize(token_mask) > shard_max_size) {
-    // The token mask is too large to be cached.
+  size_t mask_size = MemorySize(token_mask);
+  // A shared context is charged once per shard that retains it. Persistent
+  // exact-key bytes are included in the same native LRU budget as mask bytes.
+  size_t isolated_size = mask_size + StateKeySize(key) + (key.context ? ContextSize(key) : 0);
+  if (shard_max_size != kUnlimitedSize && isolated_size > shard_max_size) {
+    if (key.context) ++shard.rejected_inserts;
     return false;
   }
   if (shard.cache.find(key) != shard.cache.end()) {
@@ -3844,25 +3914,70 @@ bool RuleLevelCache::Impl::AddCache(
 
   // Evict old entries if needed.
   if (shard_max_size != kUnlimitedSize) {
-    size_t new_item_size = MemorySize(token_mask);
-    while ((shard.current_cache_memory_size) > static_cast<int64_t>(shard_max_size - new_item_size)
-    ) {
+    while (shard.current_cache_memory_size >
+           static_cast<int64_t>(shard_max_size - mask_size - AddedKeySize(shard, key))) {
       auto oldest_it = shard.cache_list.begin();
       if (oldest_it == shard.cache_list.end()) {
         // This should not happen if the size of the new item is smaller than
         // the shard budget, but this is a safeguard.
         break;
       }
-      shard.current_cache_memory_size -= MemorySize(oldest_it->second);
+      size_t removed = MemorySize(oldest_it->second);
+      const auto& old_key = oldest_it->first;
+      if (old_key.context) {
+        size_t key_size = StateKeySize(old_key);
+        auto reference = shard.context_references.find(old_key.context.get());
+        if (--reference->second == 0) {
+          key_size += ContextSize(old_key);
+          shard.context_references.erase(reference);
+        }
+        removed += key_size;
+        shard.key_memory -= key_size;
+        shard.byte_memory -= removed;
+        --shard.byte_entries;
+        ++shard.evictions;
+      }
+      shard.current_cache_memory_size -= removed;
       shard.cache.erase(oldest_it->first);
+      // List's node pool reuses slots without destroying their values. Release
+      // the old context/mask now, otherwise eviction would retain large keys
+      // outside the accounted budget until the slot happened to be reused.
+      oldest_it->first = NodeKey{};
+      oldest_it->second = AdaptiveTokenMask{};
       shard.cache_list.Erase(oldest_it);
     }
   }
 
   // Add to the cache.
-  auto new_it = shard.cache_list.PushBack(NodeType(key, std::move(token_mask)));
-  shard.current_cache_memory_size += MemorySize(new_it->second);
-  shard.cache[key] = new_it.Index();
+  size_t key_size = AddedKeySize(shard, key);
+  // Allocate all index/context bookkeeping before publishing the list node.
+  // A failure rolls those reservations back; stats are changed only after the
+  // list, lookup index and context reference count form one complete entry.
+  NodeType item(key, std::move(token_mask));
+  auto slot = shard.cache.emplace(key, -1).first;
+  bool new_context = false;
+  decltype(shard.context_references)::iterator context_ref;
+  try {
+    if (key.context) {
+      auto inserted = shard.context_references.emplace(key.context.get(), 0);
+      context_ref = inserted.first;
+      new_context = inserted.second;
+    }
+    auto new_it = shard.cache_list.PushBackNoThrowMove(std::move(item));
+    slot->second = new_it.Index();
+  } catch (...) {
+    if (new_context) shard.context_references.erase(key.context.get());
+    shard.cache.erase(slot);
+    throw;
+  }
+  shard.current_cache_memory_size += mask_size + key_size;
+  if (key.context) {
+    ++context_ref->second;
+    ++shard.inserts;
+    ++shard.byte_entries;
+    shard.key_memory += key_size;
+    shard.byte_memory += mask_size + key_size;
+  }
   return true;
 }
 
@@ -3875,7 +3990,45 @@ void RuleLevelCache::Impl::ClearCache() {
     shard.cache_list.Clear();
     shard.cache.clear();
     shard.current_cache_memory_size = 0;
+    shard.context_references.clear();
+    shard.hits = shard.misses = shard.inserts = shard.evictions = shard.rejected_inserts = 0;
+    shard.byte_entries = shard.byte_memory = shard.key_memory = 0;
   }
+}
+
+std::string RuleLevelCache::Impl::GetByteCacheStats() const {
+  int64_t hits = 0, misses = 0, inserts = 0, evictions = 0, rejected = 0;
+  int64_t entries = 0, bytes = 0, key_bytes = 0;
+  for (const auto& shard : shards_) {
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    hits += shard.hits;
+    misses += shard.misses;
+    inserts += shard.inserts;
+    evictions += shard.evictions;
+    rejected += shard.rejected_inserts;
+    entries += shard.byte_entries;
+    bytes += shard.byte_memory;
+    key_bytes += shard.key_memory;
+  }
+  picojson::object out;
+  out["enabled"] = picojson::value(true);
+  for (const auto& [name, value] : std::vector<std::pair<std::string, int64_t>>{
+           {"lookups", hits + misses},
+           {"hits", hits},
+           {"misses", misses},
+           {"inserts", inserts},
+           {"evictions", evictions},
+           {"rejected_inserts", rejected},
+           {"entries", entries},
+           {"bytes", bytes},
+           {"key_bytes", key_bytes},
+           {"limit_bytes",
+            max_cache_memory_size_ == kUnlimitedSize ? -1
+                                                     : static_cast<int64_t>(max_cache_memory_size_)}
+       }) {
+    out[name] = picojson::value(value);
+  }
+  return picojson::value(out).serialize();
 }
 
 size_t MemorySize(const RuleLevelCache& manager) { return MemorySize(manager.ImplPtr()); }

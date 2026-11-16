@@ -484,6 +484,18 @@ class RuleLevelCache {
  public:
   static const size_t kUnlimitedSize = static_cast<size_t>(-1);
 
+  // Scheme-3 uses final masks and an exact, byte-only context, rather than the
+  // native AST hash/base-mask adaptation shortcut. Context storage is shared
+  // by all states of a rule; hashes choose buckets, never establish equality.
+  struct ByteKey {
+    std::shared_ptr<const std::string> context;
+    uint64_t context_hash;
+    std::string state;
+  };
+  std::optional<AdaptiveTokenMask> GetByteCache(const ByteKey& key);
+  bool AddByteCache(const ByteKey& key, const AdaptiveTokenMask& token_mask);
+  std::string GetByteCacheStats() const;
+
   std::optional<AdaptiveTokenMask> GetCache(
       const uint64_t& fsm_hash,
       int32_t fsm_new_node_id,

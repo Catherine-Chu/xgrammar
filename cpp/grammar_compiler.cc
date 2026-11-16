@@ -18,6 +18,7 @@
 #include <variant>
 #include <vector>
 
+#include "byte_compilation_plan.h"
 #include "compiled_grammar_impl.h"
 #include "earley_parser.h"
 #include "fsm.h"
@@ -35,6 +36,43 @@
 
 namespace xgrammar {
 
+// Opt-in diagnostics contain reference indices and branch choices, never token text.
+struct ByteStateTrace {
+  int64_t rule_id = -1;
+  int64_t state_id = -1;
+  int64_t possible_token_num = 0;
+  std::vector<std::pair<int32_t, int32_t>> ranges;
+  bool fill_reject_initial = false;
+  bool fill_reject_final = false;
+  std::vector<int32_t> fast_accepted_indices;
+  std::vector<int32_t> fallback_indices;
+  std::vector<int32_t> trie_skip_visits;
+  std::vector<std::vector<int64_t>> lookahead_probes;
+};
+XGRAMMAR_MEMBER_TABLE(
+    ByteStateTrace,
+    "rule_id",
+    &ByteStateTrace::rule_id,
+    "state_id",
+    &ByteStateTrace::state_id,
+    "possible_token_num",
+    &ByteStateTrace::possible_token_num,
+    "ranges",
+    &ByteStateTrace::ranges,
+    "fill_reject_initial",
+    &ByteStateTrace::fill_reject_initial,
+    "fill_reject_final",
+    &ByteStateTrace::fill_reject_final,
+    "fast_accepted_indices",
+    &ByteStateTrace::fast_accepted_indices,
+    "fallback_indices",
+    &ByteStateTrace::fallback_indices,
+    "trie_skip_visits",
+    &ByteStateTrace::trie_skip_visits,
+    "lookahead_probes",
+    &ByteStateTrace::lookahead_probes
+);
+
 /************** AdaptiveTokenMaskCache Generator **************/
 
 /*! \brief The concrete implementation of GrammarMatcherNode. */
@@ -46,7 +84,9 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
       const std::unordered_map<int32_t, DynamicBitset>&
           tag_dispatch_rule_id_to_second_slicing_bitset,
       const TokenizerInfo& tokenizer_info,
-      std::optional<RuleLevelCache>& rule_level_cache
+      std::optional<RuleLevelCache>& rule_level_cache,
+      std::shared_ptr<const ByteCompilationPlan> byte_plan = nullptr,
+      ByteStateTrace* trace = nullptr
   )
       : EarleyParser(grammar, init_state),
         init_rule_id_(init_state.rule_id),
@@ -54,7 +94,9 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
         tag_dispatch_rule_id_to_second_slicing_bitset_(tag_dispatch_rule_id_to_second_slicing_bitset
         ),
         tokenizer_info_(tokenizer_info),
-        rule_level_cache_(rule_level_cache) {}
+        rule_level_cache_(rule_level_cache),
+        byte_plan_(std::move(byte_plan)),
+        trace_(trace) {}
   /*!
    * \brief Get the adaptive token mask for the given ParserState.
    * \param is_root_rule Whether to consider the parent rule. If false, there will be
@@ -131,6 +173,10 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
   const TokenizerInfo& tokenizer_info_;
 
   std::optional<RuleLevelCache> rule_level_cache_;
+
+  // Present only while rebuilding mixed-byte caches; no inverse map is used.
+  std::shared_ptr<const ByteCompilationPlan> byte_plan_;
+  ByteStateTrace* trace_;
 
   // Temporary data for GetAdaptiveTokenMask.
   std::vector<int32_t> tmp_accepted_indices_;
@@ -318,6 +364,9 @@ std::pair<bool, bool> GrammarMatcherForTokenMaskCache::IsTokenPassLookaheadAsser
   if (lookahead_assertion_id == -1) {
     return {accepted, can_reach_end};
   }
+  if (byte_plan_) {
+    return byte_plan_->Probe(lookahead_assertion_id, token, can_reach_end_stack);
+  }
   auto lookahead_state =
       ParserState(/*rule_id*/ -1, lookahead_assertion_id, 0, ParserState::kNoPrevInputPos, 0);
   PushStateAndExpand(lookahead_state);
@@ -504,13 +553,27 @@ bool GrammarMatcherForTokenMaskCache::GetTokenMaskWithFirstCharacterCheck(
   const auto& subtree_nodes_range = tokenizer_info_.GetTrieSubtreeNodesRange();
   // the pair (a, b) means [a, b). Intialize the possible intervals.
   std::vector<std::pair<int32_t, int32_t>> possible_intervals;
-  int possible_token_num =
-      GetPossibleTokenIntervals(sorted_decoded_vocab, first_char_mask, possible_intervals);
+  int possible_token_num;
+  if (byte_plan_) {
+    // Mixed bytes retain reference index order: native lower_bound is invalid.
+    const auto& plan = byte_plan_->GetIntervals(init_rule_id_, initial_state_.element_id);
+    possible_token_num = static_cast<int>(plan.possible_token_num);
+    possible_intervals.assign(plan.ranges.begin(), plan.ranges.end());
+  } else {
+    possible_token_num =
+        GetPossibleTokenIntervals(sorted_decoded_vocab, first_char_mask, possible_intervals);
+  }
 
   // Check if the type of the mask can be rejected.
   tmp_accepted_indices_.reserve(possible_token_num);
   bool fill_reject_indices =
       (sorted_decoded_vocab.size() - possible_token_num) < AdaptiveTokenMask::USE_BITSET_THRESHOLD;
+
+  if (trace_) {
+    trace_->possible_token_num = possible_token_num;
+    trace_->ranges = possible_intervals;
+    trace_->fill_reject_initial = fill_reject_indices;
+  }
 
   XGRAMMAR_DCHECK(possible_intervals.size() > 0)
       << "There should be at least one possible interval for the first character mask.";
@@ -552,6 +615,7 @@ bool GrammarMatcherForTokenMaskCache::GetTokenMaskWithFirstCharacterCheck(
       // Check if the current token is in the rejected range. i.e. check if the current token
       // is on the subtree of the rejected token.
       if (i < last_rejected_range) {
+        if (trace_) trace_->trie_skip_visits.push_back(i);
         if (fill_reject_indices) {
           tmp_rejected_indices_.push_back(i);
           fill_reject_indices =
@@ -586,17 +650,21 @@ bool GrammarMatcherForTokenMaskCache::GetTokenMaskWithFirstCharacterCheck(
           for (char ch : token) {
             // If the first character is not the ascii character or can't be accepted by the
             // first character mask, we need to check them in the parser.
-            if (isascii(ch) == 0 || !speculative_mask[static_cast<uint8_t>(ch)]) {
+            const bool is_reference_ascii =
+                byte_plan_ ? byte_plan_->ascii_mask[static_cast<uint8_t>(ch)] : isascii(ch) != 0;
+            if (!is_reference_ascii || !speculative_mask[static_cast<uint8_t>(ch)]) {
               all_accepted = false;
               break;
             }
           }
           if (all_accepted) {
+            if (trace_) trace_->fast_accepted_indices.push_back(i);
             tmp_accepted_indices_.push_back(i);
             continue;
           }
         }
       }
+      if (trace_) trace_->fallback_indices.push_back(i);
       // Many tokens may contain the same prefix, so we will avoid unnecessary matching
       // by finding the longest common prefix with the previous token.
       bool accepted = true;
@@ -653,6 +721,8 @@ bool GrammarMatcherForTokenMaskCache::GetTokenMaskWithFirstCharacterCheck(
       } else if (can_reach_end && prev_matched_size > 0) {
         auto [lookahead_accepted, lookahead_completed] =
             IsTokenPassLookaheadAssertion(token, tmp_can_reach_end_stack_);
+        if (trace_)
+          trace_->lookahead_probes.push_back({i, lookahead_accepted, lookahead_completed});
         if ((!is_root_rule) && lookahead_accepted) {
           if (lookahead_completed || !is_exact_lookahead) {
             tmp_uncertain_indices_.push_back(i);
@@ -702,6 +772,7 @@ bool GrammarMatcherForTokenMaskCache::GetTokenMaskWithFirstCharacterCheck(
     }
   }
 
+  if (trace_) trace_->fill_reject_final = fill_reject_indices;
   return fill_reject_indices;
 }
 
@@ -1046,9 +1117,17 @@ class GrammarCompilerSub {
 
   CompiledGrammar CompileGrammar(const std::string& ebnf_str, std::string root_rule_name);
 
+  std::string PrepareByteGrammar(const Grammar& grammar, int64_t max_observer_nodes);
+  CompiledGrammar CompileOptimizedByteGrammar(const Grammar& grammar, const std::string& plan_json);
+  std::string InspectCompilation(const Grammar& grammar, const std::string& plan_json);
+
  private:
   /*! \brief The main logic. Compile the grammar with multi-threading. */
-  CompiledGrammar MultiThreadCompileGrammar(Grammar grammar);
+  CompiledGrammar MultiThreadCompileGrammar(
+      Grammar grammar,
+      std::shared_ptr<const ByteCompilationPlan> byte_plan = nullptr,
+      std::vector<ByteStateTrace>* traces = nullptr
+  );
   /*! \brief Optimization for TagDispatch.
    *  \param compiled_grammar_impl the compiled_grammar to be optimized.
    *  \param tag_dispatch_rule_id_to_second_slicing_bitset Return value. Mapping from the rule_id to
@@ -1091,9 +1170,15 @@ static void CheckTokenIdsInVocab(const Grammar& grammar, int vocab_size) {
   }
 }
 
-CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_unoptimized) {
+CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(
+    Grammar grammar_unoptimized,
+    std::shared_ptr<const ByteCompilationPlan> byte_plan,
+    std::vector<ByteStateTrace>* traces
+) {
   auto compiled_grammar_impl = std::make_shared<CompiledGrammar::Impl>();
-  compiled_grammar_impl->grammar = GrammarOptimizer::Apply(grammar_unoptimized);
+  // Sanitized byte-mode ASTs must never be reoptimized or printed/reparsed.
+  compiled_grammar_impl->grammar =
+      byte_plan ? grammar_unoptimized : GrammarOptimizer::Apply(grammar_unoptimized);
   compiled_grammar_impl->tokenizer_info = tokenizer_info_;
   CheckTokenIdsInVocab(compiled_grammar_impl->grammar, tokenizer_info_.GetVocabSize());
   if (tokenizer_info_.GetVocabSize() == 0) {
@@ -1103,9 +1188,19 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
   TagDispatchOptimization(compiled_grammar_impl, &tag_dispatch_rule_id_to_second_slicing_bitset);
 
   // If the compiler is cache-enabled, then we hash the grammars for crossing-grammar caching.
-  if (rule_level_cache_.has_value()) {
+  if (rule_level_cache_.has_value() && !byte_plan) {
     GrammarFSMHasher().Apply(&compiled_grammar_impl->grammar);
   }
+  const bool use_byte_cache = byte_plan && rule_level_cache_.has_value() && !traces;
+  std::vector<ByteRuleCacheContext> byte_contexts;
+  if (use_byte_cache) {
+    byte_contexts = BuildByteRuleCacheContexts(compiled_grammar_impl->grammar, *byte_plan);
+  }
+  // The native basic-mask/lookahead re-adaptation optimization depends on the
+  // original AST and may change representation. Mixed-byte compilation instead
+  // reuses an exact FINAL mask; its cold computation always bypasses that path.
+  std::optional<RuleLevelCache> matcher_rule_cache = byte_plan ? std::nullopt : rule_level_cache_;
+  std::vector<ParserState> pending_byte_cache;
   // Step 3. Compute the adaptive token mask cache
   // The token mask cache is computed for these positions in the grammar:
   // 1. All character class or character class star (with last_utf8_bytes=0, 1, 2, 3)
@@ -1123,19 +1218,46 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
   }
 
   auto add_adaptive_token_mask = [&](const ParserState& state, bool is_root_rule) {
+    if (use_byte_cache) {
+      auto key = MakeByteRuleCacheKey(
+          byte_contexts[state.rule_id], *byte_plan, state.rule_id, state.element_id, is_root_rule
+      );
+      auto hit = rule_level_cache_->GetByteCache(key);
+      if (hit.has_value()) {
+        if (max_threads_ > 1) {
+          std::lock_guard<std::mutex> lock(adaptive_token_mask_cache_mutex.value());
+          compiled_grammar_impl->adaptive_token_mask_cache[state] = std::move(*hit);
+        } else {
+          compiled_grammar_impl->adaptive_token_mask_cache[state] = std::move(*hit);
+        }
+        return;
+      }
+    }
+    ByteStateTrace trace;
+    trace.rule_id = state.rule_id;
+    trace.state_id = state.element_id;
     auto grammar_matcher = GrammarMatcherForTokenMaskCache(
         compiled_grammar_impl->grammar,
         state,
         tag_dispatch_rule_id_to_second_slicing_bitset,
         tokenizer_info_,
-        rule_level_cache_
+        matcher_rule_cache,
+        byte_plan,
+        traces ? &trace : nullptr
     );
     auto cur_adaptive_token_mask_cache = grammar_matcher.GetAdaptiveTokenMask(is_root_rule);
     if (max_threads_ > 1) {
       std::lock_guard<std::mutex> lock(adaptive_token_mask_cache_mutex.value());
       compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
+      // Each worker owns its trace while computing. Publish it under the same
+      // lock as the cache entry: sorting after Join cannot repair a concurrent
+      // vector::push_back race. Production builds pass traces=nullptr.
+      if (traces) traces->push_back(std::move(trace));
+      if (use_byte_cache) pending_byte_cache.push_back(state);
     } else {
       compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
+      if (traces) traces->push_back(std::move(trace));
+      if (use_byte_cache) pending_byte_cache.push_back(state);
     }
   };
 
@@ -1174,7 +1296,71 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
     thread_pool->Join();
   }
 
+  // A validation/worker failure publishes no new entries. Only complete masks
+  // survive a successful Join. Rebuild tiny state suffixes here instead of
+  // retaining one large key or a duplicate mask for every pending task.
+  for (const auto& state : pending_byte_cache) {
+    auto key = MakeByteRuleCacheKey(
+        byte_contexts[state.rule_id],
+        *byte_plan,
+        state.rule_id,
+        state.element_id,
+        state.rule_id == root_rule_id
+    );
+    rule_level_cache_->AddByteCache(
+        key, compiled_grammar_impl->adaptive_token_mask_cache.at(state)
+    );
+  }
+
   return CompiledGrammar(compiled_grammar_impl);
+}
+
+std::string GrammarCompilerSub::PrepareByteGrammar(
+    const Grammar& grammar, int64_t max_observer_nodes
+) {
+  XGRAMMAR_CHECK(max_threads_ >= 1 && max_threads_ <= 8 && !rule_level_cache_.has_value())
+      << "mixed byte compilation requires max_threads in [1, 8] and cache_enabled=False";
+  // Thread count is a resource setting for later per-state cache construction.
+  // Preparation stays sequential and exports exactly the same immutable plan.
+  Grammar optimized = GrammarOptimizer::Apply(grammar);
+  auto plan = BuildByteCompilationPlan(optimized, tokenizer_info_, max_observer_nodes);
+  picojson::object result;
+  result["grammar_json"] = picojson::value(optimized.SerializeJSON());
+  result["plan_json"] = picojson::value(plan.SerializeJSON());
+  return picojson::value(result).serialize();
+}
+
+CompiledGrammar GrammarCompilerSub::CompileOptimizedByteGrammar(
+    const Grammar& grammar, const std::string& plan_json
+) {
+  XGRAMMAR_CHECK(max_threads_ >= 1 && max_threads_ <= 8)
+      << "mixed byte compilation requires max_threads in [1, 8]";
+  auto plan = ByteCompilationPlan::DeserializeJSON(plan_json);
+  // Complete all derived indexes before workers receive the const shared plan.
+  // Worker matchers and scratch vectors remain private to each state task.
+  plan->ValidateAndIndex(grammar, tokenizer_info_);
+  return MultiThreadCompileGrammar(grammar, std::move(plan));
+}
+
+std::string GrammarCompilerSub::InspectCompilation(
+    const Grammar& grammar, const std::string& plan_json
+) {
+  XGRAMMAR_CHECK(max_threads_ >= 1 && max_threads_ <= 8 && !rule_level_cache_.has_value())
+      << "compiler diagnostics require max_threads in [1, 8] and cache_enabled=False";
+  std::shared_ptr<ByteCompilationPlan> plan;
+  if (!plan_json.empty()) {
+    plan = ByteCompilationPlan::DeserializeJSON(plan_json);
+    plan->ValidateAndIndex(grammar, tokenizer_info_);
+  }
+  std::vector<ByteStateTrace> traces;
+  auto compiled = MultiThreadCompileGrammar(grammar, plan, &traces);
+  std::sort(traces.begin(), traces.end(), [](const auto& lhs, const auto& rhs) {
+    return std::tie(lhs.rule_id, lhs.state_id) < std::tie(rhs.rule_id, rhs.state_id);
+  });
+  picojson::object output;
+  output["compiled_grammar_json"] = picojson::value(compiled.SerializeJSON());
+  output["trace"] = AutoSerializeJSONValue(traces);
+  return picojson::value(output).serialize();
 }
 
 CompiledGrammar GrammarCompilerSub::CompileBuiltinJSONGrammar() {
@@ -1471,7 +1657,27 @@ class GrammarCompiler::Impl {
 
   CompiledGrammar CompileGrammar(const std::string& ebnf_str, std::string root_rule_name);
 
+  std::string PrepareByteGrammar(const Grammar& grammar, int64_t max_observer_nodes) {
+    XGRAMMAR_CHECK(!cache_enabled_) << "mixed byte compilation requires cache_enabled=False";
+    return no_cache_compiler_.PrepareByteGrammar(grammar, max_observer_nodes);
+  }
+
+  CompiledGrammar CompileOptimizedByteGrammar(
+      const Grammar& grammar, const std::string& plan_json
+  ) {
+    return no_cache_compiler_.CompileOptimizedByteGrammar(grammar, plan_json);
+  }
+
+  std::string InspectCompilation(const Grammar& grammar, const std::string& plan_json) {
+    XGRAMMAR_CHECK(!cache_enabled_) << "compiler diagnostics require cache_enabled=False";
+    return no_cache_compiler_.InspectCompilation(grammar, plan_json);
+  }
+
   void ClearCache();
+  std::string GetByteCacheStats() const {
+    if (rule_level_cache_) return rule_level_cache_->GetByteCacheStats();
+    return R"({"enabled":false,"lookups":0,"hits":0,"misses":0,"inserts":0,"evictions":0,"entries":0,"rejected_inserts":0,"bytes":0,"key_bytes":0,"limit_bytes":0})";
+  }
 
   int64_t GetCacheSizeBytes() const;
 
@@ -1716,7 +1922,27 @@ CompiledGrammar GrammarCompiler::CompileGrammar(
   return pimpl_->CompileGrammar(ebnf_str, root_rule_name);
 }
 
+std::string GrammarCompiler::PrepareByteGrammar(
+    const Grammar& grammar, int64_t max_observer_nodes
+) {
+  return pimpl_->PrepareByteGrammar(grammar, max_observer_nodes);
+}
+
+CompiledGrammar GrammarCompiler::CompileOptimizedByteGrammar(
+    const Grammar& grammar, const std::string& plan_json
+) {
+  return pimpl_->CompileOptimizedByteGrammar(grammar, plan_json);
+}
+
+std::string GrammarCompiler::InspectCompilation(
+    const Grammar& grammar, const std::string& plan_json
+) {
+  return pimpl_->InspectCompilation(grammar, plan_json);
+}
+
 void GrammarCompiler::ClearCache() { pimpl_->ClearCache(); }
+
+std::string GrammarCompiler::GetByteCacheStats() const { return pimpl_->GetByteCacheStats(); }
 
 int64_t GrammarCompiler::GetCacheSizeBytes() const { return pimpl_->GetCacheSizeBytes(); }
 
