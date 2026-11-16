@@ -19,13 +19,13 @@ The branch contains the cumulative Scheme 3 implementation: optimized byte-gramm
 
 Initialize submodules with `git submodule update --init --recursive` and build/install XGrammar for the target environment using its existing build system. The source already includes the cumulative patch; do not apply the companion cumulative or incremental patches again. Build once when installing or updating this package, then import the built package when starting the service. Do not copy the locally tested macOS binary to Linux or Ascend.
 
-The companion [vllm-mixed-tokenizer-demo](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/tree/demo/schema3) repository is private. It provides offline byte translation, the runtime adapter, full-vocabulary fixtures, tests and design documents. The matching vLLM branch is [demo/schema3-structured-output](https://github.com/Catherine-Chu/vllm/tree/demo/schema3-structured-output).
+The companion [vllm-mixed-tokenizer-demo](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/tree/demo/scheme3) repository is private. It provides offline byte translation, the runtime adapter, full-vocabulary fixtures, tests and design documents. The matching vLLM branch is [demo/schema3-structured-output](https://github.com/Catherine-Chu/vllm/tree/demo/schema3-structured-output).
 
-- [Pinned versions and handoff](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/blob/demo/schema3/docs/T04_HANDOFF.md)
-- [Compiler design and build steps](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/blob/demo/schema3/docs/task03_xgrammar_patch.md)
-- [Multithreading proof and tests](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/blob/demo/schema3/docs/task03_multithreading.md)
-- [Cross-rule cache proof and tests](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/blob/demo/schema3/docs/task03_rule_cache.md)
-- [Regression source and result manifest](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/blob/demo/schema3/docs/results/task04opt/review-manifest.json)
+- [Pinned versions and handoff](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/blob/demo/scheme3/docs/T04_HANDOFF.md)
+- [Compiler design and build steps](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/blob/demo/scheme3/docs/task03_xgrammar_patch.md)
+- [Multithreading proof and tests](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/blob/demo/scheme3/docs/task03_multithreading.md)
+- [Cross-rule cache proof and tests](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/blob/demo/scheme3/docs/task03_rule_cache.md)
+- [Regression source and result manifest](https://github.com/Catherine-Chu/vllm-mixed-tokenizer-demo/blob/demo/scheme3/docs/results/task04opt/review-manifest.json)
 
 Relevant companion tests are `test_task03_grammar.py`, `test_task03_thread_native.py`, `test_task03_rule_cache.py`, `test_task03_rule_cache_native.py` and `test_task03_gate.py`; the complete T04 regression entry is `scripts/run_task04opt_regression.py`. Keeping these tests with the companion project preserves their fixtures and cross-repository contracts.
 
