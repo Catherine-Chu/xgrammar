@@ -169,11 +169,37 @@ std::string AdaptiveTokenMask::Print(const TokenizerInfo& tokenizer_info) const 
 
 /************** CompiledGrammar::Impl **************/
 
+CharacterBudgetInfo::CharacterBudgetInfo(
+    const TokenizerInfo& tokenizer_info, const std::vector<int64_t>& start_bytes
+) : utf8_start_bytes(start_bytes) {
+  if (start_bytes.size() != 192) {
+    throw std::invalid_argument("mapped UTF-8 start predicate must have 192 bytes");
+  }
+  for (int64_t byte : start_bytes) {
+    if (byte < 0 || byte > 255 || utf8_start_mask[byte]) {
+      throw std::invalid_argument("invalid or duplicate UTF-8 start byte");
+    }
+    utf8_start_mask.set(byte);
+  }
+  const auto& vocab = tokenizer_info.GetSortedDecodedVocab();
+  token_char_counts.reserve(vocab.size());
+  for (const auto& entry : vocab) {
+    int32_t count = 0;
+    for (uint8_t byte : entry.second) count += utf8_start_mask[byte];
+    token_char_counts.push_back(count);
+    max_token_chars = std::max(max_token_chars, count);
+  }
+}
+
 picojson::value SerializeJSONValue(const CompiledGrammar::Impl& impl) {
   auto result = picojson::object{};
   result["grammar"] = AutoSerializeJSONValue(impl.grammar);
   result["tokenizer_metadata"] = impl.tokenizer_info->DumpMetadataValue();
   result["adaptive_token_mask_cache"] = AutoSerializeJSONValue(impl.adaptive_token_mask_cache);
+  if (impl.character_budget_info) {
+    result["utf8_start_bytes"] =
+        AutoSerializeJSONValue(impl.character_budget_info->utf8_start_bytes);
+  }
   return picojson::value(result);
 }
 
@@ -206,6 +232,21 @@ std::optional<SerializationError> DeserializeJSONValue(
     );
   }
   impl->tokenizer_info = tokenizer_info;
+  // Native/legacy compiled grammars omit this optional field and retain their
+  // original UTF-8 semantics. Mixed-budget imports carry it explicitly; their
+  // counts are rebuilt in the supplied vocabulary's sorted-index order.
+  if (auto found = object.find("utf8_start_bytes"); found != object.end()) {
+    std::vector<int64_t> start_bytes;
+    if (auto error = AutoDeserializeJSONValue(&start_bytes, found->second, type_name)) {
+      return error;
+    }
+    try {
+      impl->character_budget_info =
+          std::make_shared<const CharacterBudgetInfo>(tokenizer_info, start_bytes);
+    } catch (const std::invalid_argument& error) {
+      return ConstructDeserializeError(error.what(), type_name);
+    }
+  }
   if (object.find("adaptive_token_mask_cache") == object.end()) {
     return ConstructDeserializeError("Expect a 'adaptive_token_mask_cache' field", type_name);
   }
@@ -242,7 +283,13 @@ std::optional<SerializationError> DeserializeJSONValue(
 /************** CompiledGrammar **************/
 
 std::size_t MemorySize(const CompiledGrammar::Impl& impl) {
-  return MemorySize(impl.grammar) + MemorySize(impl.adaptive_token_mask_cache);
+  auto bytes = MemorySize(impl.grammar) + MemorySize(impl.adaptive_token_mask_cache);
+  if (impl.character_budget_info) {
+    bytes += sizeof(CharacterBudgetInfo) +
+             impl.character_budget_info->utf8_start_bytes.capacity() * sizeof(int64_t) +
+             impl.character_budget_info->token_char_counts.capacity() * sizeof(int32_t);
+  }
+  return bytes;
 }
 
 std::size_t CompiledGrammar::MemorySizeBytes() const { return MemorySize(*pimpl_); }

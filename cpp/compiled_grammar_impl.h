@@ -26,6 +26,23 @@ namespace xgrammar {
 /******************* CompiledGrammar Datastructures *******************/
 
 /*!
+ * \brief Character-count view over one fixed TokenizerInfo and byte alphabet.
+ *
+ * Only mixed grammars with max_chars need this view. The vocabulary itself is
+ * shared unchanged; the derived counts replace the native UTF-8 counts only
+ * for this compiled grammar. Published through shared_ptr<const ...> so worker
+ * threads, matchers and profiles cannot mutate each other's character semantics.
+ */
+struct CharacterBudgetInfo {
+  std::vector<int64_t> utf8_start_bytes;
+  std::bitset<256> utf8_start_mask;
+  std::vector<int32_t> token_char_counts;
+  int32_t max_token_chars = 0;
+
+  CharacterBudgetInfo(const TokenizerInfo& tokenizer_info, const std::vector<int64_t>& start_bytes);
+};
+
+/*!
  * \brief Preprocessed information, for a given specific ParserState, divides the token set
  * into three categories: accepted, rejected, and uncertain.
  * Accepted: tokens that can be determined by the current ParserState to be acceptable
@@ -111,6 +128,10 @@ class CompiledGrammar::Impl {
 
   /*! \brief The tokenizer information. */
   TokenizerInfo tokenizer_info{NullObj{}};
+
+  // Not serialized as derived arrays: transport the predicate and rebuild
+  // against the TokenizerInfo supplied to DeserializeJSON instead.
+  std::shared_ptr<const CharacterBudgetInfo> character_budget_info;
 
   /*! \brief Default constructor. */
   Impl() = default;

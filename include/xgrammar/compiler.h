@@ -111,18 +111,32 @@ class GrammarCompiler {
   /*! \brief Trusted scheme-3 export: optimized Grammar and native observations.
    * No token mask/cache is transported. Requires cache disabled and max_threads in [1, 8].
    * Export stays sequential; max_threads controls only later per-state cache construction.
+   * experimental_unproven relaxes scope gates only for explicit offline diagnosis.
    */
-  std::string PrepareByteGrammar(const Grammar& grammar, int64_t max_observer_nodes = 2000000);
+  std::string PrepareByteGrammar(
+      const Grammar& grammar,
+      int64_t max_observer_nodes = 2000000,
+      bool experimental_unproven = false
+  );
 
   /*! \brief Rebuild caches directly from a validated byte-translated optimized Grammar.
    * The plan has reference indices/intervals and mapped helper observers, no inverse map.
    * Requires max_threads in [1, 8]. When cache is enabled, exact final state masks
    * are reused through RuleLevelCache; ordinary compile APIs are unchanged.
+   * experimental_unproven requires cache disabled and keeps structural validation.
    */
-  CompiledGrammar CompileOptimizedByteGrammar(const Grammar& grammar, const std::string& plan_json);
+  CompiledGrammar CompileOptimizedByteGrammar(
+      const Grammar& grammar,
+      const std::string& plan_json,
+      bool experimental_unproven = false
+  );
 
   /*! \brief Test-only actual compilation and index-only trace; empty plan selects native mode. */
-  std::string InspectCompilation(const Grammar& grammar, const std::string& plan_json = "");
+  std::string InspectCompilation(
+      const Grammar& grammar,
+      const std::string& plan_json = "",
+      bool experimental_unproven = false
+  );
 
   /*! \brief Clear the internal cache of compiled grammars. */
   void ClearCache();

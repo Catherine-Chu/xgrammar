@@ -88,7 +88,7 @@ class GrammarMatcherForTokenMaskCache : public EarleyParser {
       std::shared_ptr<const ByteCompilationPlan> byte_plan = nullptr,
       ByteStateTrace* trace = nullptr
   )
-      : EarleyParser(grammar, init_state),
+      : EarleyParser(grammar, init_state, byte_plan ? byte_plan->utf8_start_mask : std::nullopt),
         init_rule_id_(init_state.rule_id),
         initial_state_(init_state),
         tag_dispatch_rule_id_to_second_slicing_bitset_(tag_dispatch_rule_id_to_second_slicing_bitset
@@ -1117,9 +1117,15 @@ class GrammarCompilerSub {
 
   CompiledGrammar CompileGrammar(const std::string& ebnf_str, std::string root_rule_name);
 
-  std::string PrepareByteGrammar(const Grammar& grammar, int64_t max_observer_nodes);
-  CompiledGrammar CompileOptimizedByteGrammar(const Grammar& grammar, const std::string& plan_json);
-  std::string InspectCompilation(const Grammar& grammar, const std::string& plan_json);
+  std::string PrepareByteGrammar(
+      const Grammar& grammar, int64_t max_observer_nodes, bool experimental_unproven
+  );
+  CompiledGrammar CompileOptimizedByteGrammar(
+      const Grammar& grammar, const std::string& plan_json, bool experimental_unproven
+  );
+  std::string InspectCompilation(
+      const Grammar& grammar, const std::string& plan_json, bool experimental_unproven
+  );
 
  private:
   /*! \brief The main logic. Compile the grammar with multi-threading. */
@@ -1180,6 +1186,14 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(
   compiled_grammar_impl->grammar =
       byte_plan ? grammar_unoptimized : GrammarOptimizer::Apply(grammar_unoptimized);
   compiled_grammar_impl->tokenizer_info = tokenizer_info_;
+  if (byte_plan && !byte_plan->utf8_start_bytes.empty()) {
+    for (int32_t rule_id = 0; rule_id < compiled_grammar_impl->grammar->NumRules(); ++rule_id) {
+      if (compiled_grammar_impl->grammar->GetRule(rule_id).max_chars < 0) continue;
+      compiled_grammar_impl->character_budget_info =
+          std::make_shared<const CharacterBudgetInfo>(tokenizer_info_, byte_plan->utf8_start_bytes);
+      break;
+    }
+  }
   CheckTokenIdsInVocab(compiled_grammar_impl->grammar, tokenizer_info_.GetVocabSize());
   if (tokenizer_info_.GetVocabSize() == 0) {
     return CompiledGrammar(compiled_grammar_impl);
@@ -1316,14 +1330,16 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(
 }
 
 std::string GrammarCompilerSub::PrepareByteGrammar(
-    const Grammar& grammar, int64_t max_observer_nodes
+    const Grammar& grammar, int64_t max_observer_nodes, bool experimental_unproven
 ) {
   XGRAMMAR_CHECK(max_threads_ >= 1 && max_threads_ <= 8 && !rule_level_cache_.has_value())
       << "mixed byte compilation requires max_threads in [1, 8] and cache_enabled=False";
   // Thread count is a resource setting for later per-state cache construction.
   // Preparation stays sequential and exports exactly the same immutable plan.
   Grammar optimized = GrammarOptimizer::Apply(grammar);
-  auto plan = BuildByteCompilationPlan(optimized, tokenizer_info_, max_observer_nodes);
+  auto plan = BuildByteCompilationPlan(
+      optimized, tokenizer_info_, max_observer_nodes, experimental_unproven
+  );
   picojson::object result;
   result["grammar_json"] = picojson::value(optimized.SerializeJSON());
   result["plan_json"] = picojson::value(plan.SerializeJSON());
@@ -1331,26 +1347,31 @@ std::string GrammarCompilerSub::PrepareByteGrammar(
 }
 
 CompiledGrammar GrammarCompilerSub::CompileOptimizedByteGrammar(
-    const Grammar& grammar, const std::string& plan_json
+    const Grammar& grammar, const std::string& plan_json, bool experimental_unproven
 ) {
   XGRAMMAR_CHECK(max_threads_ >= 1 && max_threads_ <= 8)
       << "mixed byte compilation requires max_threads in [1, 8]";
+  // The exact cross-rule key covers the proved serving subset only. An
+  // unproven metadata/edge experiment must compute every state independently;
+  // otherwise a key omitting that new semantic input could create a false hit.
+  XGRAMMAR_CHECK(!experimental_unproven || !rule_level_cache_.has_value())
+      << "experimental_unproven compilation requires cache_enabled=False";
   auto plan = ByteCompilationPlan::DeserializeJSON(plan_json);
   // Complete all derived indexes before workers receive the const shared plan.
   // Worker matchers and scratch vectors remain private to each state task.
-  plan->ValidateAndIndex(grammar, tokenizer_info_);
+  plan->ValidateAndIndex(grammar, tokenizer_info_, experimental_unproven);
   return MultiThreadCompileGrammar(grammar, std::move(plan));
 }
 
 std::string GrammarCompilerSub::InspectCompilation(
-    const Grammar& grammar, const std::string& plan_json
+    const Grammar& grammar, const std::string& plan_json, bool experimental_unproven
 ) {
   XGRAMMAR_CHECK(max_threads_ >= 1 && max_threads_ <= 8 && !rule_level_cache_.has_value())
       << "compiler diagnostics require max_threads in [1, 8] and cache_enabled=False";
   std::shared_ptr<ByteCompilationPlan> plan;
   if (!plan_json.empty()) {
     plan = ByteCompilationPlan::DeserializeJSON(plan_json);
-    plan->ValidateAndIndex(grammar, tokenizer_info_);
+    plan->ValidateAndIndex(grammar, tokenizer_info_, experimental_unproven);
   }
   std::vector<ByteStateTrace> traces;
   auto compiled = MultiThreadCompileGrammar(grammar, plan, &traces);
@@ -1657,20 +1678,24 @@ class GrammarCompiler::Impl {
 
   CompiledGrammar CompileGrammar(const std::string& ebnf_str, std::string root_rule_name);
 
-  std::string PrepareByteGrammar(const Grammar& grammar, int64_t max_observer_nodes) {
+  std::string PrepareByteGrammar(
+      const Grammar& grammar, int64_t max_observer_nodes, bool experimental_unproven
+  ) {
     XGRAMMAR_CHECK(!cache_enabled_) << "mixed byte compilation requires cache_enabled=False";
-    return no_cache_compiler_.PrepareByteGrammar(grammar, max_observer_nodes);
+    return no_cache_compiler_.PrepareByteGrammar(grammar, max_observer_nodes, experimental_unproven);
   }
 
   CompiledGrammar CompileOptimizedByteGrammar(
-      const Grammar& grammar, const std::string& plan_json
+      const Grammar& grammar, const std::string& plan_json, bool experimental_unproven
   ) {
-    return no_cache_compiler_.CompileOptimizedByteGrammar(grammar, plan_json);
+    return no_cache_compiler_.CompileOptimizedByteGrammar(grammar, plan_json, experimental_unproven);
   }
 
-  std::string InspectCompilation(const Grammar& grammar, const std::string& plan_json) {
+  std::string InspectCompilation(
+      const Grammar& grammar, const std::string& plan_json, bool experimental_unproven
+  ) {
     XGRAMMAR_CHECK(!cache_enabled_) << "compiler diagnostics require cache_enabled=False";
-    return no_cache_compiler_.InspectCompilation(grammar, plan_json);
+    return no_cache_compiler_.InspectCompilation(grammar, plan_json, experimental_unproven);
   }
 
   void ClearCache();
@@ -1923,21 +1948,21 @@ CompiledGrammar GrammarCompiler::CompileGrammar(
 }
 
 std::string GrammarCompiler::PrepareByteGrammar(
-    const Grammar& grammar, int64_t max_observer_nodes
+    const Grammar& grammar, int64_t max_observer_nodes, bool experimental_unproven
 ) {
-  return pimpl_->PrepareByteGrammar(grammar, max_observer_nodes);
+  return pimpl_->PrepareByteGrammar(grammar, max_observer_nodes, experimental_unproven);
 }
 
 CompiledGrammar GrammarCompiler::CompileOptimizedByteGrammar(
-    const Grammar& grammar, const std::string& plan_json
+    const Grammar& grammar, const std::string& plan_json, bool experimental_unproven
 ) {
-  return pimpl_->CompileOptimizedByteGrammar(grammar, plan_json);
+  return pimpl_->CompileOptimizedByteGrammar(grammar, plan_json, experimental_unproven);
 }
 
 std::string GrammarCompiler::InspectCompilation(
-    const Grammar& grammar, const std::string& plan_json
+    const Grammar& grammar, const std::string& plan_json, bool experimental_unproven
 ) {
-  return pimpl_->InspectCompilation(grammar, plan_json);
+  return pimpl_->InspectCompilation(grammar, plan_json, experimental_unproven);
 }
 
 void GrammarCompiler::ClearCache() { pimpl_->ClearCache(); }

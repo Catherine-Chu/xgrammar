@@ -9,6 +9,7 @@
 #include <bitset>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -46,15 +47,21 @@ struct ByteCompilationPlan {
   std::vector<int64_t> sorted_token_ids;
   std::vector<int64_t> trie_subtree_nodes_range;
   std::vector<int64_t> ascii_bytes;
+  // Optional for legacy plans without character budgets. These are the images
+  // of the 192 native non-continuation bytes, not an inverse byte permutation.
+  std::vector<int64_t> utf8_start_bytes;
   std::vector<ByteIntervalPlan> intervals;
   std::vector<ByteLookaheadObserver> observers;
 
   // Derived lookup data are deliberately not part of the transport representation.
   std::bitset<256> ascii_mask;
+  std::optional<std::bitset<256>> utf8_start_mask;
   std::unordered_map<uint64_t, size_t> interval_index;
   std::unordered_map<int64_t, size_t> observer_index;
 
-  void ValidateAndIndex(const Grammar& grammar, const TokenizerInfo& tokenizer);
+  void ValidateAndIndex(
+      const Grammar& grammar, const TokenizerInfo& tokenizer, bool experimental_unproven = false
+  );
   const ByteIntervalPlan& GetIntervals(int32_t rule_id, int32_t state_id) const;
   std::pair<bool, bool> Probe(
       int32_t lookahead_id, const std::string& token, const std::vector<bool>& end_positions
@@ -63,10 +70,14 @@ struct ByteCompilationPlan {
   static std::shared_ptr<ByteCompilationPlan> DeserializeJSON(const std::string& json);
 };
 
-// Both stages reject unsupported semantic features before an optimized AST is sanitized.
-void ValidateOptimizedByteGrammar(const Grammar& grammar);
+// The explicit diagnostic mode skips only proven-scope gates. Structural safety
+// and plan/tokenizer consistency remain mandatory; no semantic metadata is removed.
+void ValidateOptimizedByteGrammar(const Grammar& grammar, bool experimental_unproven = false);
 ByteCompilationPlan BuildByteCompilationPlan(
-    const Grammar& grammar, const TokenizerInfo& tokenizer, int64_t max_observer_nodes
+    const Grammar& grammar,
+    const TokenizerInfo& tokenizer,
+    int64_t max_observer_nodes,
+    bool experimental_unproven = false
 );
 
 // Build each dependency-closed rule context once. Global rule/state numbers,
@@ -124,6 +135,8 @@ XGRAMMAR_MEMBER_TABLE(
     &ByteCompilationPlan::trie_subtree_nodes_range,
     "ascii_bytes",
     &ByteCompilationPlan::ascii_bytes,
+    "utf8_start_bytes",
+    &ByteCompilationPlan::utf8_start_bytes,
     "intervals",
     &ByteCompilationPlan::intervals,
     "observers",

@@ -595,21 +595,23 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       )
       .def(
           "prepare_byte_grammar",
-          [](GrammarCompilerObj* o, O grammar_ref, int64_t max_nodes) {
+          [](GrammarCompilerObj* o, O grammar_ref, int64_t max_nodes, bool experimental_unproven) {
             XGRAMMAR_FFI_TRY_BEGIN();
             return ffi::String(
-                o->value.PrepareByteGrammar(grammar_ref.as<GrammarObj>()->value, max_nodes)
+                o->value.PrepareByteGrammar(
+                    grammar_ref.as<GrammarObj>()->value, max_nodes, experimental_unproven
+                )
             );
             XGRAMMAR_FFI_TRY_END();
           }
       )
       .def(
           "compile_optimized_byte_grammar",
-          [](GrammarCompilerObj* o, O grammar_ref, ffi::String plan_json) {
+          [](GrammarCompilerObj* o, O grammar_ref, ffi::String plan_json, bool experimental_unproven) {
             XGRAMMAR_FFI_TRY_BEGIN();
             return ffi::ObjectRef(
                 ffi::make_object<CompiledGrammarObj>(o->value.CompileOptimizedByteGrammar(
-                    grammar_ref.as<GrammarObj>()->value, plan_json
+                    grammar_ref.as<GrammarObj>()->value, plan_json, experimental_unproven
                 ))
             );
             XGRAMMAR_FFI_TRY_END();
@@ -617,10 +619,12 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       )
       .def(
           "inspect_compilation",
-          [](GrammarCompilerObj* o, O grammar_ref, ffi::String plan_json) {
+          [](GrammarCompilerObj* o, O grammar_ref, ffi::String plan_json, bool experimental_unproven) {
             XGRAMMAR_FFI_TRY_BEGIN();
             return ffi::String(
-                o->value.InspectCompilation(grammar_ref.as<GrammarObj>()->value, plan_json)
+                o->value.InspectCompilation(
+                    grammar_ref.as<GrammarObj>()->value, plan_json, experimental_unproven
+                )
             );
             XGRAMMAR_FFI_TRY_END();
           }

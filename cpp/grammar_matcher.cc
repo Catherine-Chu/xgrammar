@@ -474,7 +474,15 @@ class GrammarMatcher::Impl : public EarleyParser {
       int max_rollback_tokens = -1,
       std::optional<float> default_temperature = std::nullopt
   )
-      : EarleyParser(compiled_grammar->grammar),
+      : EarleyParser(
+            compiled_grammar->grammar,
+            std::nullopt,
+            compiled_grammar->character_budget_info
+                ? std::optional<std::bitset<256>>(
+                      compiled_grammar->character_budget_info->utf8_start_mask
+                  )
+                : std::nullopt
+        ),
         compiled_grammar_(compiled_grammar),
         tokenizer_info_(compiled_grammar->tokenizer_info),
         stop_token_ids_(override_stop_tokens.value_or(tokenizer_info_.GetStopTokenIds())),
@@ -712,6 +720,17 @@ class GrammarMatcher::Impl : public EarleyParser {
 
   CompiledGrammar compiled_grammar_;
   TokenizerInfo tokenizer_info_;
+
+  const std::vector<int32_t>& GetTokenCharCounts() const {
+    return compiled_grammar_->character_budget_info
+               ? compiled_grammar_->character_budget_info->token_char_counts
+               : tokenizer_info_.ImplPtr()->GetTokenCharCounts();
+  }
+  int32_t GetMaxTokenChars() const {
+    return compiled_grammar_->character_budget_info
+               ? compiled_grammar_->character_budget_info->max_token_chars
+               : tokenizer_info_.ImplPtr()->GetMaxTokenChars();
+  }
   std::vector<int> stop_token_ids_;
   bool terminate_without_stop_token_;
   std::optional<float> default_temperature_;
@@ -1743,7 +1762,7 @@ bool GrammarMatcher::Impl::FillNextTokenBitmask(
 void GrammarMatcher::Impl::FillBitmaskForCharBudgetBoundary(
     const AdaptiveTokenMask& adaptive_token_mask, int32_t remaining_chars
 ) {
-  const auto& token_char_counts = tokenizer_info_.ImplPtr()->GetTokenCharCounts();
+  const auto& token_char_counts = GetTokenCharCounts();
   const auto& vocab = tokenizer_info_.GetSortedDecodedVocab();
 
   std::vector<int32_t> tokens_to_check = adaptive_token_mask.uncertain_indices;
@@ -1906,7 +1925,7 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
     const auto& adaptive_token_mask = adaptive_token_mask_it->second;
     if (state.char_budget_deadline >= 0) {
       int32_t remaining_chars = state.char_budget_deadline - GetCurrentCharIndex();
-      if (remaining_chars <= tokenizer_info_.ImplPtr()->GetMaxTokenChars()) {
+      if (remaining_chars <= GetMaxTokenChars()) {
         FillBitmaskForCharBudgetBoundary(adaptive_token_mask, std::max(remaining_chars, 0));
         continue;
       }
@@ -1921,7 +1940,7 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
     }
   }
 
-  const auto& token_char_counts = tokenizer_info_.ImplPtr()->GetTokenCharCounts();
+  const auto& token_char_counts = GetTokenCharCounts();
   for (const auto& [state, adaptive_token_mask_it] : latest_states_with_masks) {
     const auto& adaptive_token_mask = adaptive_token_mask_it->second;
 

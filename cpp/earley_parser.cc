@@ -454,8 +454,13 @@ void EarleyParser::RemoveCommittedLazyStates() {
   );
 }
 
-EarleyParser::EarleyParser(const Grammar& grammar, std::optional<ParserState> initial_state)
+EarleyParser::EarleyParser(
+    const Grammar& grammar,
+    std::optional<ParserState> initial_state,
+    std::optional<std::bitset<256>> utf8_start_mask
+)
     : grammar_(grammar),
+      utf8_start_mask_(std::move(utf8_start_mask)),
       fsm_state_flags_cache_(grammar->NumRules()),
       rule_is_nullable_(grammar->NumRules(), 0) {
   if (!grammar->optimized) {

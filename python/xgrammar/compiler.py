@@ -371,21 +371,42 @@ class GrammarCompiler(XGRObject):
         else:
             raise ValueError("Invalid grammar type. Please pass a string or a Grammar object.")
 
-    def prepare_byte_grammar(self, grammar: Grammar, *, max_observer_nodes: int = 2000000) -> str:
+    def prepare_byte_grammar(
+        self,
+        grammar: Grammar,
+        *,
+        max_observer_nodes: int = 2000000,
+        experimental_unproven: bool = False,
+    ) -> str:
         """Export optimized Grammar and native scheme-3 compilation sidecars as JSON.
 
         This trusted preprocessing creates no final mask cache. The caller translates
         byte fields and binds the result to an immutable model/profile. Cache must be
         disabled, and max_threads must be in [1, 8]. Preparation itself stays
         sequential; the thread setting does not change its serialized output.
+        experimental_unproven explicitly relaxes only the proved feature-scope
+        gates for offline comparisons. It does not repair unsupported semantics
+        or weaken structural/plan validation, and is never a serving default.
         """
         if not isinstance(grammar, Grammar):
             raise TypeError("prepare_byte_grammar requires a Grammar object")
         if type(max_observer_nodes) is not int or not 1 <= max_observer_nodes <= 10000000:
             raise ValueError("max_observer_nodes must be in [1, 10000000]")
-        return str(self._handle.prepare_byte_grammar(grammar._handle, max_observer_nodes))
+        if type(experimental_unproven) is not bool:
+            raise TypeError("experimental_unproven must be a bool")
+        return str(
+            self._handle.prepare_byte_grammar(
+                grammar._handle, max_observer_nodes, experimental_unproven
+            )
+        )
 
-    def compile_optimized_byte_grammar(self, grammar: Grammar, plan_json: str) -> CompiledGrammar:
+    def compile_optimized_byte_grammar(
+        self,
+        grammar: Grammar,
+        plan_json: str,
+        *,
+        experimental_unproven: bool = False,
+    ) -> CompiledGrammar:
         """Build native caches without reoptimizing a translated, sanitized Grammar.
 
         Sidecars supply reference intervals, the permuted ASCII predicate and finite
@@ -396,14 +417,27 @@ class GrammarCompiler(XGRObject):
         cache_enabled=True reuses exact final state masks across compatible
         rules, after validating each new plan. Native AST/base-mask lookahead
         adaptation is deliberately bypassed for this byte-only entry.
+        experimental_unproven requires cache_enabled=False: the production
+        exact key is not proved to include every newly admitted semantic input.
+        This mode makes a real compilation attempt, not a support guarantee.
         """
         if not isinstance(grammar, Grammar) or not isinstance(plan_json, str):
             raise TypeError("expected a Grammar and byte-plan JSON string")
+        if type(experimental_unproven) is not bool:
+            raise TypeError("experimental_unproven must be a bool")
         return CompiledGrammar._create_from_handle(
-            self._handle.compile_optimized_byte_grammar(grammar._handle, plan_json)
+            self._handle.compile_optimized_byte_grammar(
+                grammar._handle, plan_json, experimental_unproven
+            )
         )
 
-    def inspect_compilation(self, grammar: Grammar, plan_json: Optional[str] = None) -> str:
+    def inspect_compilation(
+        self,
+        grammar: Grammar,
+        plan_json: Optional[str] = None,
+        *,
+        experimental_unproven: bool = False,
+    ) -> str:
         """Test-only actual compilation and index/branch trace, without token text.
 
         None selects native optimization and cache construction. A plan selects the
@@ -411,6 +445,8 @@ class GrammarCompiler(XGRObject):
         This diagnostic entry requires cache disabled and max_threads in [1, 8].
         Traces are published safely and sorted by rule/state after all workers join,
         so thread completion order is not part of the comparison contract.
+        experimental_unproven affects only an explicitly supplied byte plan;
+        the native reference compilation with plan_json=None remains unchanged.
         """
         if not isinstance(grammar, Grammar) or (
             plan_json is not None and not isinstance(plan_json, str)
@@ -418,7 +454,13 @@ class GrammarCompiler(XGRObject):
             raise TypeError("expected a Grammar and optional byte-plan JSON string")
         if plan_json is not None and not plan_json.strip():
             raise ValueError("an explicit byte plan must not be empty")
-        return str(self._handle.inspect_compilation(grammar._handle, plan_json or ""))
+        if type(experimental_unproven) is not bool:
+            raise TypeError("experimental_unproven must be a bool")
+        return str(
+            self._handle.inspect_compilation(
+                grammar._handle, plan_json or "", experimental_unproven
+            )
+        )
 
     def clear_cache(self) -> None:
         """Clear all cached compiled grammars."""

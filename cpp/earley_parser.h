@@ -7,6 +7,7 @@
 #ifndef XGRAMMAR_EARLEY_PARSER_H_
 #define XGRAMMAR_EARLEY_PARSER_H_
 #include <algorithm>
+#include <bitset>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -326,6 +327,10 @@ class EarleyParser {
   /*! \brief The grammar to be parsed. */
   Grammar grammar_;
 
+  // Immutable after construction. A mixed compiled grammar supplies the
+  // transported Unicode-start predicate; ordinary native parsers use nullopt.
+  const std::optional<std::bitset<256>> utf8_start_mask_;
+
   /*! \brief In this round of advancing, check if the stop token can be accepted. */
   bool tmp_accept_stop_token_ = false;
 
@@ -451,7 +456,9 @@ class EarleyParser {
     return state.char_budget_deadline >= 0 && GetCurrentCharIndex() >= state.char_budget_deadline;
   }
 
-  static bool StartsUTF8Codepoint(uint8_t byte) { return (byte & 0xC0) != 0x80; }
+  bool StartsUTF8Codepoint(uint8_t byte) const {
+    return utf8_start_mask_ ? (*utf8_start_mask_)[byte] : (byte & 0xC0) != 0x80;
+  }
 
   /*! \brief Whether any rule of the grammar has a capture or stop_capture name. Fixed at
    * construction. When false, the capture machinery is fully disabled and has no overhead. */
@@ -672,7 +679,9 @@ class EarleyParser {
    * from the root rule of the grammar.
    */
   explicit EarleyParser(
-      const Grammar& grammar, std::optional<ParserState> initial_state = std::nullopt
+      const Grammar& grammar,
+      std::optional<ParserState> initial_state = std::nullopt,
+      std::optional<std::bitset<256>> utf8_start_mask = std::nullopt
   );
 
   /*!

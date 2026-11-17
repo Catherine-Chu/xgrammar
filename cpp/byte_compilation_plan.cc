@@ -125,11 +125,15 @@ ByteLookaheadObserver BuildObserver(
 }
 }  // namespace
 
-void ValidateOptimizedByteGrammar(const Grammar& grammar) {
+void ValidateOptimizedByteGrammar(const Grammar& grammar, bool experimental_unproven) {
   Require(!grammar.IsNull(), "missing grammar");
   if (auto error = grammar->Validate()) throw std::invalid_argument(*error);
   Require(grammar->optimized, "an already optimized grammar is required");
   for (int32_t rule_id = 0; rule_id < grammar->NumRules(); ++rule_id) {
+    // These exclusions delimit the proved serving subset, not the native
+    // grammar representation. Diagnostic compilation retains all metadata and
+    // exercises the actual compiler so unsupported behavior remains observable.
+    if (experimental_unproven) continue;
     const auto& rule = grammar->GetRule(rule_id);
     Require(
         grammar->GetSuffixStopInfo(rule_id) == nullptr, "suffix/capture metadata is unsupported"
@@ -150,12 +154,12 @@ void ValidateOptimizedByteGrammar(const Grammar& grammar) {
     for (int32_t state = 0; state < fsm.NumStates(); ++state) {
       for (const auto& edge : fsm.GetEdges(state)) {
         Require(
-            !edge.IsToken() && !edge.IsExcludeToken(),
+            experimental_unproven || (!edge.IsToken() && !edge.IsExcludeToken()),
             "explicit Token/ExcludeToken edges are unsupported"
         );
         Require(
             edge.IsCharRange() || edge.IsEpsilon() || edge.IsRuleRef() || edge.IsRepeatRef() ||
-                edge.IsEOS(),
+                edge.IsEOS() || edge.IsToken() || edge.IsExcludeToken(),
             "unknown FSM edge type"
         );
         Require(
@@ -170,9 +174,12 @@ void ValidateOptimizedByteGrammar(const Grammar& grammar) {
 }
 
 ByteCompilationPlan BuildByteCompilationPlan(
-    const Grammar& grammar, const TokenizerInfo& tokenizer, int64_t max_observer_nodes
+    const Grammar& grammar,
+    const TokenizerInfo& tokenizer,
+    int64_t max_observer_nodes,
+    bool experimental_unproven
 ) {
-  ValidateOptimizedByteGrammar(grammar);
+  ValidateOptimizedByteGrammar(grammar, experimental_unproven);
   Require(
       max_observer_nodes > 0 && max_observer_nodes <= kMaxObserverNodes,
       "observer node budget must be in [1, 10000000]"
@@ -184,6 +191,13 @@ ByteCompilationPlan BuildByteCompilationPlan(
   const auto& trie = tokenizer.GetTrieSubtreeNodesRange();
   plan.trie_subtree_nodes_range.assign(trie.begin(), trie.end());
   for (int64_t i = 0; i < 128; ++i) plan.ascii_bytes.push_back(i);
+  for (int32_t rule_id = 0; rule_id < grammar->NumRules(); ++rule_id) {
+    if (grammar->GetRule(rule_id).max_chars < 0) continue;
+    for (int64_t byte = 0; byte < 256; ++byte) {
+      if ((byte & 0xC0) != 0x80) plan.utf8_start_bytes.push_back(byte);
+    }
+    break;
+  }
   for (const auto& [rule, state] : ScanableStates(grammar)) {
     std::bitset<256> first_chars;
     const auto& fsm = grammar->per_rule_fsms[rule]->GetFsm().GetFsm();
@@ -210,12 +224,14 @@ ByteCompilationPlan BuildByteCompilationPlan(
       );
     }
   }
-  plan.ValidateAndIndex(grammar, tokenizer);
+  plan.ValidateAndIndex(grammar, tokenizer, experimental_unproven);
   return plan;
 }
 
-void ByteCompilationPlan::ValidateAndIndex(const Grammar& grammar, const TokenizerInfo& tokenizer) {
-  ValidateOptimizedByteGrammar(grammar);
+void ByteCompilationPlan::ValidateAndIndex(
+    const Grammar& grammar, const TokenizerInfo& tokenizer, bool experimental_unproven
+) {
+  ValidateOptimizedByteGrammar(grammar, experimental_unproven);
   Require(format == "xgrammar-mixed-byte-plan-v1", "unsupported plan ABI");
   Require(vocab_size == tokenizer.GetVocabSize(), "vocabulary width mismatch");
   const auto& vocab = tokenizer.GetSortedDecodedVocab();
@@ -235,6 +251,32 @@ void ByteCompilationPlan::ValidateAndIndex(const Grammar& grammar, const Tokeniz
   for (int64_t byte : ascii_bytes) {
     Require(byte >= 0 && byte <= 255 && !ascii_mask[byte], "invalid or duplicate ASCII byte");
     ascii_mask.set(byte);
+  }
+  bool has_character_budget = false;
+  for (int32_t rule_id = 0; rule_id < grammar->NumRules(); ++rule_id) {
+    has_character_budget |= grammar->GetRule(rule_id).max_chars >= 0;
+  }
+  // A legacy mixed budget artifact is known to count the wrong alphabet. Do
+  // not silently treat a missing predicate as the native UTF-8 predicate.
+  Require(
+      !has_character_budget || !utf8_start_bytes.empty(),
+      "character budget requires utf8_start_bytes; rebuild the mixed artifact"
+  );
+  utf8_start_mask.reset();
+  if (!utf8_start_bytes.empty()) {
+    Require(utf8_start_bytes.size() == 192, "mapped UTF-8 start predicate must have 192 bytes");
+    utf8_start_mask.emplace();
+    for (int64_t byte : utf8_start_bytes) {
+      Require(
+          byte >= 0 && byte <= 255 && !(*utf8_start_mask)[byte],
+          "invalid or duplicate UTF-8 start byte"
+      );
+      utf8_start_mask->set(byte);
+    }
+    Require(
+        std::equal(ascii_bytes.begin(), ascii_bytes.end(), utf8_start_bytes.begin()),
+        "UTF-8 start predicate prefix must match the mapped ASCII bytes"
+    );
   }
   auto expected_states = ScanableStates(grammar);
   Require(intervals.size() == expected_states.size(), "interval state coverage mismatch");
@@ -256,7 +298,21 @@ void ByteCompilationPlan::ValidateAndIndex(const Grammar& grammar, const Tokeniz
         interval_index.emplace(StateKey(interval.rule_id, interval.state_id), index).second,
         "duplicate interval state"
     );
-    Require(!interval.ranges.empty(), "missing byte candidate intervals");
+    if (interval.ranges.empty()) {
+      // Token-only scan states legitimately have no byte candidate interval.
+      // Do not synthesize an interval or erase the explicit Token/ExcludeToken
+      // edge. A state containing any byte edge still needs its native plan.
+      const auto edges = grammar->per_rule_fsms[interval.rule_id]->GetFsm().GetFsm().GetEdges(
+          interval.state_id
+      );
+      const bool no_byte_edges = std::none_of(edges.begin(), edges.end(), [](const auto& edge) {
+        return edge.IsCharRange();
+      });
+      Require(
+          experimental_unproven && interval.possible_token_num == 0 && no_byte_edges,
+          "missing byte candidate intervals"
+      );
+    }
     int64_t count = 0;
     int64_t previous_end = 0;
     for (const auto& range : interval.ranges) {
@@ -454,12 +510,26 @@ RuleLevelCache::ByteKey MakeByteRuleCacheKey(
   return {context.bytes, context.hash, std::move(state)};
 }
 
-std::string ByteCompilationPlan::SerializeJSON() const { return AutoSerializeJSON(*this); }
+std::string ByteCompilationPlan::SerializeJSON() const {
+  auto value = AutoSerializeJSONValue(*this);
+  // Keep unbudgeted plans byte-compatible with their previous representation.
+  if (utf8_start_bytes.empty()) value.get<picojson::object>().erase("utf8_start_bytes");
+  return value.serialize();
+}
 
 std::shared_ptr<ByteCompilationPlan> ByteCompilationPlan::DeserializeJSON(const std::string& json) {
   Require(json.size() <= kMaxPlanBytes, "serialized plan exceeds 64 MiB");
+  picojson::value value;
+  if (auto error = ParseJSON(value, json); !error.empty()) {
+    throw InvalidJSONError("Failed to parse mixed byte plan: " + error);
+  }
+  Require(value.is<picojson::object>(), "serialized plan must be an object");
+  auto& object = value.get<picojson::object>();
+  if (!object.count("utf8_start_bytes")) {
+    object["utf8_start_bytes"] = picojson::value(picojson::array{});
+  }
   auto result = std::make_shared<ByteCompilationPlan>();
-  if (auto error = AutoDeserializeJSON(result.get(), json, false, "ByteCompilationPlan")) {
+  if (auto error = AutoDeserializeJSONValue(result.get(), value, "ByteCompilationPlan")) {
     std::visit([](const auto& value) { throw value; }, *error);
   }
   return result;
